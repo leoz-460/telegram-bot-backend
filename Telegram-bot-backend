@@ -1,0 +1,147 @@
+// 📁 Estrutura de arquivos sugerida:
+// - index.js
+// - .env
+// - public/
+// - uploads/
+// - database.sqlite (SQLite usado para persistência simples)
+
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+const path = require('path');
+const multer = require('multer');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
+
+const app = express();
+app.use(bodyParser.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// 📦 Configuração do multer para upload
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + '-' + file.originalname);
+  }
+});
+const upload = multer({ storage });
+
+// 🗃️ Banco de dados SQLite
+const db = new sqlite3.Database('./database.sqlite');
+
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS bots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_email TEXT,
+      token TEXT NOT NULL,
+      username TEXT,
+      mensagem_inicial TEXT,
+      imagem TEXT,
+      audio TEXT,
+      planos TEXT,
+      botoes TEXT
+    )
+  `);
+});
+
+// 🔄 Salvar/atualizar bot
+app.post('/api/bot', (req, res) => {
+  const {
+    user_email, token, username,
+    mensagem_inicial, imagem, audio,
+    planos, botoes
+  } = req.body;
+
+  db.run(
+    `INSERT INTO bots (user_email, token, username, mensagem_inicial, imagem, audio, planos, botoes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [user_email, token, username, mensagem_inicial, imagem, audio, JSON.stringify(planos), JSON.stringify(botoes)],
+    function (err) {
+      if (err) return res.status(500).json({ erro: err.message });
+      res.json({ id: this.lastID });
+    }
+  );
+});
+
+// 🔍 Obter bot pelo token (usado no webhook)
+app.get('/api/bot/:token', (req, res) => {
+  const token = req.params.token;
+  db.get(`SELECT * FROM bots WHERE token = ?`, [token], (err, row) => {
+    if (err) return res.status(500).json({ erro: err.message });
+    if (!row) return res.status(404).json({ erro: 'Bot não encontrado' });
+    res.json(row);
+  });
+});
+
+// ✅ Webhook do Telegram
+app.post('/api/webhook/telegram', async (req, res) => {
+  const message = req.body.message;
+  if (!message) return res.sendStatus(200);
+
+  const chatId = message.chat.id;
+  const text = message.text || '';
+  const token = TELEGRAM_BOT_TOKEN; // Para multiplos bots, associar token no futuro
+
+  if (text === '/start') {
+    db.get(`SELECT * FROM bots WHERE token = ?`, [token], async (err, row) => {
+      if (err || !row) return res.sendStatus(200);
+
+      const planos = JSON.parse(row.planos);
+      const botoes = JSON.parse(row.botoes);
+
+      const botoesInline = botoes.map(btn => ([{ text: btn.texto, url: btn.url }]));
+      const textoComPlanos = [
+        row.mensagem_inicial,
+        '',
+        planos.map(p => `🧾 *${p.nome}* - ${p.duracao} - *${p.valor}*`).join('\n')
+      ].join('\n');
+
+      try {
+        if (row.imagem) {
+          await axios.post(`https://api.telegram.org/bot${token}/sendPhoto`, {
+            chat_id: chatId,
+            photo: row.imagem,
+            caption: textoComPlanos,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: botoesInline }
+          });
+        } else {
+          await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+            chat_id: chatId,
+            text: textoComPlanos,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: botoesInline }
+          });
+        }
+
+        if (row.audio) {
+          await axios.post(`https://api.telegram.org/bot${token}/sendAudio`, {
+            chat_id: chatId,
+            audio: row.audio
+          });
+        }
+      } catch (error) {
+        console.error('Erro ao enviar mensagem:', error.response?.data || error.message);
+      }
+    });
+  }
+  res.sendStatus(200);
+});
+
+// 📤 Upload de mídia
+app.post('/api/upload', upload.single('arquivo'), (req, res) => {
+  if (!req.file) return res.status(400).json({ erro: 'Arquivo não enviado' });
+  const url = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  res.json({ url });
+});
+
+// Teste
+app.get('/', (req, res) => {
+  res.send('Servidor Telegram com banco rodando.');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
